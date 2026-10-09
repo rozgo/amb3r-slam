@@ -8,17 +8,22 @@ from amb3r_slam.tools.geometry import (average_transforms, sim3_from_matrix, sim
                                       sim3_mul, sim3_to_se3_matrix)
 
 
-def _umeyama_from_cameras(P_local, P_world, weights=None, s_prior=None, min_sep=1e-6):
-    """Sim(3) taking a forward's local frame into the world, from cameras known in both."""
+def _umeyama_from_cameras(P_local, P_world, weights=None, s_prior=None, min_sep=1e-6,
+                          scale=None):
+    """Sim(3) taking a forward's local frame into the world, from cameras known in both.
+    ``scale``, when given, is used instead of the ratio of the cameras' distances."""
     F = P_local.shape[0]
-    if F < 2:
-        return None
-    cw, cl = P_world[:, :3, 3], P_local[:, :3, 3]
-    iu = torch.triu_indices(F, F, offset=1, device=cw.device)
-    dw = (cw[iu[0]] - cw[iu[1]]).norm(dim=-1)
-    dl = (cl[iu[0]] - cl[iu[1]]).norm(dim=-1)
-    ok = (dl > min_sep) & (dw > min_sep)
-    s = float(torch.median(dw[ok] / dl[ok])) if int(ok.sum()) else float('nan')
+    if scale is not None and np.isfinite(scale) and scale > 0:
+        s = float(scale)
+    else:
+        if F < 2:
+            return None
+        cw, cl = P_world[:, :3, 3], P_local[:, :3, 3]
+        iu = torch.triu_indices(F, F, offset=1, device=cw.device)
+        dw = (cw[iu[0]] - cw[iu[1]]).norm(dim=-1)
+        dl = (cl[iu[0]] - cl[iu[1]]).norm(dim=-1)
+        ok = (dl > min_sep) & (dw > min_sep)
+        s = float(torch.median(dw[ok] / dl[ok])) if int(ok.sum()) else float('nan')
     if not np.isfinite(s) or s <= 0:
         if s_prior is None or not np.isfinite(s_prior) or s_prior <= 0:
             return None
@@ -51,6 +56,7 @@ class FrontEnd:
         self.recent = []
         self.poses = {}
         self.scale = None
+        self.kf_depth = None    # the keyframe's depth at the subsampled pixels, in world units
         self.last_conf = 0.0
 
 
@@ -59,6 +65,39 @@ class FrontEnd:
         poses, pts, conf, self._last_K, _ = self.net(images, ref, self.calib_K)
         pts, conf = self.net.subsample(pts, conf)
         return poses, pts, conf
+
+    @staticmethod
+    def _depth(pts, pose):
+        """Depth of one view's points (N, 3), given in a pass's frame, in its own camera."""
+        return ((pts.reshape(-1, 3).float() - pose[:3, 3].float()) @ pose[:3, :3].float())[:, 2]
+
+    def _depth_scale(self, pts, conf, poses_l, k):
+        """World units per unit of this pass, from the keyframe alone: its depth in world units
+        over the depth this pass gives it, on its more confident half. Unlike the cameras'
+        distances, this does not depend on frames this front-end has placed since the
+        keyframe, so an error in one frame's placement does not feed the next frame's scale."""
+        if self.kf_depth is None:
+            return None
+        d = self._depth(pts[k], poses_l[k])
+        if d.shape != self.kf_depth.shape:
+            return None
+        c = conf[k].reshape(-1).float()
+        ok = torch.isfinite(d) & torch.isfinite(self.kf_depth) & (d > 1e-6) & (self.kf_depth > 1e-6)
+        if int(ok.sum()) < 32:
+            return None
+        ok &= c >= torch.median(c[ok])
+        s = float(torch.median(self.kf_depth[ok] / d[ok]))
+        return s if np.isfinite(s) and s > 0 else None
+
+    def reseat(self, frame, pose, depth, recent):
+        """Restart tracking from the backend: keyframe ``frame`` at ``pose`` with its depth in
+        world units, and ``recent`` (frame, pose) pairs as the context views."""
+        self.kf_idx, self.kf_pose = frame, pose
+        self.kf_depth = None if depth is None else depth.to(self.device).float()
+        self.recent = [(f, p) for f, p in recent]
+        for f, p in recent:
+            self.poses[f] = p
+        self.poses[frame] = pose
 
     def align_to(self, frames, P):
         """Sim(3) taking this front-end's world onto ``P``, the backend's poses of ``frames``,
@@ -90,6 +129,8 @@ class FrontEnd:
         self.reanchor(keys, P)
         if self.scale is not None:
             self.scale = float(self.scale) * float(D[7])
+        if self.kf_depth is not None:
+            self.kf_depth = self.kf_depth * float(D[7])
 
     @torch.no_grad()
     def track(self, imgs, f):
@@ -110,11 +151,12 @@ class FrontEnd:
         known = [(k, v) for k, v in enumerate(views) if v in self.poses]
         j = views.index(f)
         k = views.index(self.kf_idx)
-        if len(known) >= 2:
+        s_kf = self._depth_scale(pts, conf, poses_l, k)
+        if len(known) >= 2 or s_kf is not None:
             rows = torch.tensor([k0 for k0, _ in known], device=poses_l.device)
             P_world = torch.stack([self.poses[v] for _, v in known]).to(poses_l.device)
             P_local = poses_l[rows].float()
-            g = _umeyama_from_cameras(P_local, P_world.float(), s_prior=self.scale)
+            g = _umeyama_from_cameras(P_local, P_world.float(), s_prior=self.scale, scale=s_kf)
         else:
             k0 = known[0][0]
             g0 = sim3_from_matrix(self.poses[views[k0]].double(), scale=1.0).float()
@@ -124,6 +166,8 @@ class FrontEnd:
             return self.poses.get(f)
 
         self.scale = float(g[7])
+        if self.kf_depth is None:
+            self.kf_depth = self._depth(pts[k], poses_l[k]) * self.scale
         gl = sim3_from_matrix(poses_l[j].double(), scale=1.0).float()
         pose = sim3_to_se3_matrix(sim3_mul(g, gl))
         if not torch.isfinite(pose).all():
@@ -135,6 +179,7 @@ class FrontEnd:
         if ov < float(fcfg.min_overlap) or \
                 (f - self.kf_idx) >= int(fcfg.max_gap):
             self.kf_idx, self.kf_pose = f, pose
+            self.kf_depth = self._depth(pts[j], poses_l[j]) * self.scale
         self.recent.append((f, pose))
         self.recent = self.recent[-max(1, n_ctx):]
         return pose

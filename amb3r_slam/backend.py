@@ -570,6 +570,16 @@ class HierarchicalBackend:
         if D is not None:
             st.fe.transform(D)
         st.fe.reanchor(submap.frames, P)
+        if hasattr(st.fe, 'reseat'):
+            # Restart tracking from the submap's newest frames, with the newest one's depth in
+            # world units as the keyframe's: the next frames are placed and scaled from the
+            # backend alone, not from poses the front-end placed since the last hand-off.
+            i = max(range(len(submap.frames)), key=lambda r: submap.frames[r])
+            T = submap.poses[i].float()
+            depth = ((submap.pts[i].reshape(-1, 3).float() - T[:3, 3]) @ T[:3, :3])[:, 2] * float(st.S[-1][7])
+            n_ctx = max(1, int(self.cfg.frontend.context))
+            newest = sorted(range(len(submap.frames)), key=lambda r: submap.frames[r])[-n_ctx:]
+            st.fe.reseat(submap.frames[i], P[i], depth, [(submap.frames[r], P[r]) for r in newest])
         for i, fr in enumerate(submap.frames):
             st.online[fr] = P[i].detach().cpu()
 
