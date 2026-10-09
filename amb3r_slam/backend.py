@@ -474,6 +474,13 @@ class HierarchicalBackend:
             return
         sm = self._new_submap(a, b, own)
         if st.warming and st.submaps:
+            # The longer warm-up pass has its own origin and scale: align it to the pass it
+            # replaces, so the world (and every pose already handed out) stays put.
+            g, _info = self._align_pair(st.submaps[-1], sm)
+            if g is not None:
+                g = g.to(self.device)
+                st.S[-1] = sim3_mul(st.S[-1], g)
+                st.S_odo[-1] = sim3_mul(st.S_odo[-1], g)
             self._record(sm, replaces=st.submaps[-1])
             st.submaps[-1] = sm
         else:
@@ -550,10 +557,18 @@ class HierarchicalBackend:
         return list(range(a + (-a) % d0, b, d0))
 
     def _reanchor(self, submap):
-        """Hand a finished submap's poses to the front-end and the online trajectory."""
+        """Hand a finished submap's poses to the front-end and the online trajectory.
+
+        Only the submap's frames get backend poses, and the front-end's other poses (its
+        keyframe and recent frames among them) are in its own world, with another origin and
+        scale. So every pose it holds is first carried into the backend's world with one
+        Sim(3), fitted on the frames both have; otherwise its next fits mix the two worlds."""
         st = self._st
         P = sim3_to_se3_matrix(sim3_mul(st.S[-1],
                                         sim3_from_matrix(submap.poses.double()).float()))
+        D = st.fe.align_to(submap.frames, P) if hasattr(st.fe, 'align_to') else None
+        if D is not None:
+            st.fe.transform(D)
         st.fe.reanchor(submap.frames, P)
         for i, fr in enumerate(submap.frames):
             st.online[fr] = P[i].detach().cpu()

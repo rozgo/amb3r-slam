@@ -60,8 +60,19 @@ class FrontEnd:
         pts, conf = self.net.subsample(pts, conf)
         return poses, pts, conf
 
+    def align_to(self, frames, P):
+        """Sim(3) taking this front-end's world onto ``P``, the backend's poses of ``frames``,
+        fitted on the frames already tracked here; None when fewer than two are shared."""
+        rows = [i for i, fr in enumerate(frames) if fr in self.poses]
+        if len(rows) < 2:
+            return None
+        P_mine = torch.stack([self.poses[frames[i]] for i in rows]).to(self.device).float()
+        g = _umeyama_from_cameras(P_mine, P[rows].to(self.device).float())
+        return g if g is not None and torch.isfinite(g).all() else None
+
     def reanchor(self, frames, P):
-        """Replace the poses of ``frames`` with the backend's, so tracking restarts from them."""
+        """Replace the poses of ``frames`` with the backend's, so tracking restarts from them.
+        ``P`` must be in the same world as the poses kept (see ``align_to``)."""
         for i, fr in enumerate(frames):
             self.poses[fr] = P[i]
         if self.kf_idx in self.poses:
